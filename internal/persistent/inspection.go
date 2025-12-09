@@ -1,0 +1,401 @@
+package persistent
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"sync"
+	"time"
+
+	"github.com/nirarg/v2v-vm-validations/internal/inspection"
+	"github.com/nirarg/v2v-vm-validations/pkg/types"
+	"github.com/sirupsen/logrus"
+)
+
+// Credentials holds vCenter access details
+type Credentials struct {
+	VCenterURL string
+	Username   string
+	Password   string
+}
+
+// CacheKey represents a unique identifier for a VM+snapshot pair
+type CacheKey struct {
+	VMName       string
+	SnapshotName string
+}
+
+// String returns a string representation of the cache key
+func (k CacheKey) String() string {
+	return fmt.Sprintf("%s:%s", k.VMName, k.SnapshotName)
+}
+
+// Hash returns a hash of the cache key for use as a storage key
+func (k CacheKey) Hash() string {
+	h := sha256.New()
+	h.Write([]byte(k.String()))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// DB defines the interface for persisting inspection data
+// Callers must implement this interface to provide persistence
+type DB interface {
+	// GetVirtInspectorXML retrieves VirtInspector inspection data for a given cache key
+	// Returns nil if not found
+	GetVirtInspectorXML(ctx context.Context, key CacheKey) (*types.VirtInspectorXML, error)
+
+	// SetVirtInspectorXML stores VirtInspector inspection data for a given cache key
+	SetVirtInspectorXML(ctx context.Context, key CacheKey, data *types.VirtInspectorXML) error
+
+	// GetVirtV2VInspectorXML retrieves VirtV2vInspector inspection data for a given cache key
+	// Returns nil if not found
+	GetVirtV2VInspectorXML(ctx context.Context, key CacheKey) (*types.VirtV2VInspectorXML, error)
+
+	// SetVirtV2VInspectorXML stores VirtV2vInspector inspection data for a given cache key
+	SetVirtV2VInspectorXML(ctx context.Context, key CacheKey, data *types.VirtV2VInspectorXML) error
+}
+
+// Inspector wraps both VirtInspector and VirtV2vInspector with memory and DB persistence
+type Inspector struct {
+	virtInspector       *inspection.VirtInspector
+	virtV2vInspector    *inspection.VirtV2vInspector
+	db                  DB
+	credentials         Credentials
+	virtMemoryCache     *virtInspectorMemoryCache
+	virtV2vMemoryCache  *virtV2vInspectorMemoryCache
+	virtInflight        *inflightTracker[*types.VirtInspectorXML]
+	virtV2vInflight     *inflightTracker[*types.VirtV2VInspectorXML]
+	logger              *logrus.Logger
+}
+
+// NewInspector creates a new Inspector that supports both inspection methods
+// virtInspectorPath: path to virt-inspector executable (uses system PATH if empty)
+// virtV2vInspectorPath: path to virt-v2v-inspector executable (uses system PATH if empty)
+// timeout: timeout for inspection operations (defaults to 5 minutes if zero)
+// credentials: vCenter access credentials
+// logger: logger instance for logging (can be nil)
+// db: database implementation provided by caller (can be nil for memory-only caching)
+func NewInspector(virtInspectorPath string, virtV2vInspectorPath string, timeout time.Duration, credentials Credentials, logger *logrus.Logger, db DB) *Inspector {
+	return &Inspector{
+		virtInspector:      inspection.NewVirtInspector(virtInspectorPath, timeout, logger),
+		virtV2vInspector:   inspection.NewVirtV2vInspector(virtV2vInspectorPath, timeout, logger),
+		db:                 db,
+		credentials:        credentials,
+		virtMemoryCache:    newVirtInspectorMemoryCache(),
+		virtV2vMemoryCache: newVirtV2vInspectorMemoryCache(),
+		virtInflight:       newInflightTracker[*types.VirtInspectorXML](),
+		virtV2vInflight:    newInflightTracker[*types.VirtV2VInspectorXML](),
+		logger:             logger,
+	}
+}
+
+// InspectWithVirt performs inspection using VirtInspector with memory and DB caching
+// Concurrent calls for the same VM-snapshot key will wait for the first call to complete
+func (p *Inspector) InspectWithVirt(
+	ctx context.Context,
+	vmName string,
+	snapshotName string,
+	datacenter string,
+	diskInfo *types.SnapshotDiskInfo,
+) (*types.VirtInspectorXML, error) {
+	key := CacheKey{
+		VMName:       vmName,
+		SnapshotName: snapshotName,
+	}
+
+	// Check memory cache first
+	if cached := p.virtMemoryCache.get(key); cached != nil {
+		if p.logger != nil {
+			p.logger.WithFields(logrus.Fields{
+				"vm_name":       vmName,
+				"snapshot_name": snapshotName,
+			}).Debug("Inspection data found in memory cache")
+		}
+		return cached, nil
+	}
+
+	// Check if there's already an inflight request for this key
+	// If yes, wait for it; if no, we become the one doing the work
+	result, err, isWaiter := p.virtInflight.do(key, func() (*types.VirtInspectorXML, error) {
+		// Double-check memory cache (another goroutine might have populated it)
+		if cached := p.virtMemoryCache.get(key); cached != nil {
+			if p.logger != nil {
+				p.logger.WithFields(logrus.Fields{
+					"vm_name":       vmName,
+					"snapshot_name": snapshotName,
+				}).Debug("Inspection data found in memory cache (double-check)")
+			}
+			return cached, nil
+		}
+
+		// Check DB if provided
+		if p.db != nil {
+			cached, err := p.db.GetVirtInspectorXML(ctx, key)
+			if err != nil {
+				if p.logger != nil {
+					p.logger.WithError(err).Warn("Failed to get inspection data from DB")
+				}
+			} else if cached != nil {
+				if p.logger != nil {
+					p.logger.WithFields(logrus.Fields{
+						"vm_name":       vmName,
+						"snapshot_name": snapshotName,
+					}).Debug("Inspection data found in DB")
+				}
+				// Store in memory cache for faster subsequent access
+				p.virtMemoryCache.set(key, cached)
+				return cached, nil
+			}
+		}
+
+		// Perform actual inspection
+		if p.logger != nil {
+			p.logger.WithFields(logrus.Fields{
+				"vm_name":       vmName,
+				"snapshot_name": snapshotName,
+			}).Info("Performing new inspection (not found in cache)")
+		}
+
+		result, err := p.virtInspector.Inspect(ctx, vmName, snapshotName, p.credentials.VCenterURL, datacenter, p.credentials.Username, p.credentials.Password, diskInfo)
+		if err != nil {
+			return nil, err
+		}
+
+		// Store in memory cache
+		p.virtMemoryCache.set(key, result)
+
+		// Store in DB if provided
+		if p.db != nil {
+			if err := p.db.SetVirtInspectorXML(ctx, key, result); err != nil {
+				if p.logger != nil {
+					p.logger.WithError(err).Warn("Failed to store inspection data in DB")
+				}
+				// Don't fail the inspection if DB storage fails
+			}
+		}
+
+		return result, nil
+	})
+
+	if isWaiter && p.logger != nil {
+		p.logger.WithFields(logrus.Fields{
+			"vm_name":       vmName,
+			"snapshot_name": snapshotName,
+		}).Debug("Waited for inflight inspection to complete")
+	}
+
+	return result, err
+}
+
+// InspectWithVirtV2v performs inspection using VirtV2vInspector with memory and DB caching
+// Concurrent calls for the same VM-snapshot key will wait for the first call to complete
+func (p *Inspector) InspectWithVirtV2v(
+	ctx context.Context,
+	vmName string,
+	snapshotName string,
+	datacenter string,
+	diskInfo *types.SnapshotDiskInfo,
+	sslVerify string,
+) (*types.VirtV2VInspectorXML, error) {
+	key := CacheKey{
+		VMName:       vmName,
+		SnapshotName: snapshotName,
+	}
+
+	// Check memory cache first
+	if cached := p.virtV2vMemoryCache.get(key); cached != nil {
+		if p.logger != nil {
+			p.logger.WithFields(logrus.Fields{
+				"vm_name":       vmName,
+				"snapshot_name": snapshotName,
+			}).Debug("Inspection data found in memory cache")
+		}
+		return cached, nil
+	}
+
+	// Check if there's already an inflight request for this key
+	// If yes, wait for it; if no, we become the one doing the work
+	result, err, isWaiter := p.virtV2vInflight.do(key, func() (*types.VirtV2VInspectorXML, error) {
+		// Double-check memory cache (another goroutine might have populated it)
+		if cached := p.virtV2vMemoryCache.get(key); cached != nil {
+			if p.logger != nil {
+				p.logger.WithFields(logrus.Fields{
+					"vm_name":       vmName,
+					"snapshot_name": snapshotName,
+				}).Debug("Inspection data found in memory cache (double-check)")
+			}
+			return cached, nil
+		}
+
+		// Check DB if provided
+		if p.db != nil {
+			cached, err := p.db.GetVirtV2VInspectorXML(ctx, key)
+			if err != nil {
+				if p.logger != nil {
+					p.logger.WithError(err).Warn("Failed to get inspection data from DB")
+				}
+			} else if cached != nil {
+				if p.logger != nil {
+					p.logger.WithFields(logrus.Fields{
+						"vm_name":       vmName,
+						"snapshot_name": snapshotName,
+					}).Debug("Inspection data found in DB")
+				}
+				// Store in memory cache for faster subsequent access
+				p.virtV2vMemoryCache.set(key, cached)
+				return cached, nil
+			}
+		}
+
+		// Perform actual inspection
+		if p.logger != nil {
+			p.logger.WithFields(logrus.Fields{
+				"vm_name":       vmName,
+				"snapshot_name": snapshotName,
+			}).Info("Performing new inspection (not found in cache)")
+		}
+
+		result, err := p.virtV2vInspector.Inspect(ctx, vmName, snapshotName, p.credentials.VCenterURL, datacenter, p.credentials.Username, p.credentials.Password, diskInfo, sslVerify)
+		if err != nil {
+			return nil, err
+		}
+
+		// Store in memory cache
+		p.virtV2vMemoryCache.set(key, result)
+
+		// Store in DB if provided
+		if p.db != nil {
+			if err := p.db.SetVirtV2VInspectorXML(ctx, key, result); err != nil {
+				if p.logger != nil {
+					p.logger.WithError(err).Warn("Failed to store inspection data in DB")
+				}
+				// Don't fail the inspection if DB storage fails
+			}
+		}
+
+		return result, nil
+	})
+
+	if isWaiter && p.logger != nil {
+		p.logger.WithFields(logrus.Fields{
+			"vm_name":       vmName,
+			"snapshot_name": snapshotName,
+		}).Debug("Waited for inflight inspection to complete")
+	}
+
+	return result, err
+}
+
+// virtInspectorMemoryCache provides in-memory caching for VirtInspector results
+type virtInspectorMemoryCache struct {
+	mu    sync.RWMutex
+	cache map[string]*types.VirtInspectorXML
+}
+
+// newVirtInspectorMemoryCache creates a new in-memory cache
+func newVirtInspectorMemoryCache() *virtInspectorMemoryCache {
+	return &virtInspectorMemoryCache{
+		cache: make(map[string]*types.VirtInspectorXML),
+	}
+}
+
+// get retrieves data from memory cache
+func (c *virtInspectorMemoryCache) get(key CacheKey) *types.VirtInspectorXML {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.cache[key.String()]
+}
+
+// set stores data in memory cache
+func (c *virtInspectorMemoryCache) set(key CacheKey, data *types.VirtInspectorXML) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cache[key.String()] = data
+}
+
+// virtV2vInspectorMemoryCache provides in-memory caching for VirtV2vInspector results
+type virtV2vInspectorMemoryCache struct {
+	mu    sync.RWMutex
+	cache map[string]*types.VirtV2VInspectorXML
+}
+
+// newVirtV2vInspectorMemoryCache creates a new in-memory cache
+func newVirtV2vInspectorMemoryCache() *virtV2vInspectorMemoryCache {
+	return &virtV2vInspectorMemoryCache{
+		cache: make(map[string]*types.VirtV2VInspectorXML),
+	}
+}
+
+// get retrieves data from memory cache
+func (c *virtV2vInspectorMemoryCache) get(key CacheKey) *types.VirtV2VInspectorXML {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.cache[key.String()]
+}
+
+// set stores data in memory cache
+func (c *virtV2vInspectorMemoryCache) set(key CacheKey, data *types.VirtV2VInspectorXML) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cache[key.String()] = data
+}
+
+// inflightCall represents an ongoing inspection call
+type inflightCall[T any] struct {
+	wg  sync.WaitGroup
+	val T
+	err error
+}
+
+// inflightTracker tracks ongoing inspection requests per key
+// Ensures only one inspection runs per key, with concurrent requests waiting
+type inflightTracker[T any] struct {
+	mu      sync.Mutex
+	calls   map[string]*inflightCall[T]
+}
+
+// newInflightTracker creates a new inflight tracker
+func newInflightTracker[T any]() *inflightTracker[T] {
+	return &inflightTracker[T]{
+		calls: make(map[string]*inflightCall[T]),
+	}
+}
+
+// do executes the given function for the key, or waits if another goroutine is already executing it
+// Returns: (result, error, isWaiter)
+// - isWaiter is true if this call waited for another goroutine's result
+// - isWaiter is false if this call actually executed the function
+func (t *inflightTracker[T]) do(key CacheKey, fn func() (T, error)) (T, error, bool) {
+	keyStr := key.String()
+
+	t.mu.Lock()
+	if call, exists := t.calls[keyStr]; exists {
+		// Another goroutine is already working on this key
+		t.mu.Unlock()
+
+		// Wait for it to complete
+		call.wg.Wait()
+
+		return call.val, call.err, true
+	}
+
+	// We are the first one for this key - create a new call
+	call := &inflightCall[T]{}
+	call.wg.Add(1)
+	t.calls[keyStr] = call
+	t.mu.Unlock()
+
+	// Execute the function
+	call.val, call.err = fn()
+
+	// Mark as done
+	call.wg.Done()
+
+	// Remove from inflight map
+	t.mu.Lock()
+	delete(t.calls, keyStr)
+	t.mu.Unlock()
+
+	return call.val, call.err, false
+}
