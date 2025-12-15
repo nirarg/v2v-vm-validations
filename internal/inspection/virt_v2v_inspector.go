@@ -56,17 +56,12 @@ func (i *VirtV2vInspector) Inspect(
 	}).Info("Running virt-v2v-inspector on snapshot")
 
 	// Build libvirt connection URL for vSphere
-	// Format: vpx://username@vcenter/compute-resource-path?ssl-verify
+	// Format: vpx://vcenter/compute-resource-path?ssl-verify (credentials via auth file)
 	// The path must point to a compute resource (host/cluster), not the datacenter or VM
 	// The VM name is specified as a positional argument after "--"
+	// Credentials are provided via LIBVIRT_AUTH_FILE instead of embedding in URL for security
 	// Extract hostname from vCenter URL
 	vcenterHost := extractHostname(vcenterURL)
-
-	// URL-encode username to handle special characters like @
-	// The @ symbol in the username needs to be percent-encoded as %40
-	// because @ is used as a delimiter between username and hostname in URLs
-	// We use url.QueryEscape which encodes @ as %40
-	encodedUsername := url.QueryEscape(username)
 
 	// Use the compute resource path from diskInfo (e.g., "/Datacenter/Cluster/host.example.com")
 	// This is required for vpx:// URLs - they need a compute resource, not just a datacenter
@@ -75,34 +70,33 @@ func (i *VirtV2vInspector) Inspect(
 		return nil, fmt.Errorf("compute resource path is required for vpx:// URL")
 	}
 
-	// Build vpx:// URL (without snapshot parameter)
-	// Inspect the base/parent disk file directly
-	// The snapshot parameter is not needed when using the parent file
+	// Create libvirt auth file with credentials
+	// This avoids embedding username in the URL for better security
+	authFile, err := i.createLibvirtAuthFile(vcenterHost, username, password)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create libvirt auth file: %w", err)
+	}
+	defer os.Remove(authFile) // Clean up the auth file
+
+	// Build vpx:// URL without embedded credentials
+	// Authentication will be handled via the auth file using LIBVIRT_AUTH_FILE env var
 	// Add SSL verification parameter (provided by caller)
-	libvirtURL := fmt.Sprintf("vpx://%s@%s%s?%s",
-		encodedUsername, vcenterHost, computeResourcePath, sslVerify)
+	libvirtURL := fmt.Sprintf("vpx://%s%s?%s",
+		vcenterHost, computeResourcePath, sslVerify)
 
 	// Create context with timeout
 	inspectCtx, cancel := context.WithTimeout(ctx, i.timeout)
 	defer cancel()
 
-	// virt-v2v-inspector expects -ip to be a file path, not the password directly
-	// Create a temporary file with the password
-	passwordFile, err := i.createPasswordFile(password)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create password file: %w", err)
-	}
-	defer os.Remove(passwordFile) // Clean up the temporary file
-
 	var output []byte
 
 	// Build virt-v2v-inspector command
+	// Authentication is handled via LIBVIRT_AUTH_FILE environment variable
 	args := []string{
 		"-v",            // Verbose
 		"-x",            // Debug
 		"-i", "libvirt", // Input type: libvirt
-		"-ic", libvirtURL, // libvirt connection URI (vpx://...)
-		"-ip", passwordFile, // libvirt password file path (not password directly)
+		"-ic", libvirtURL, // libvirt connection URI (vpx://... without credentials)
 		"-it", "vddk", // Input transport: VDDK
 	}
 
@@ -130,24 +124,21 @@ func (i *VirtV2vInspector) Inspect(
 
 	args = append(args, "--", vmName)
 
-	// Log the command (without password file path)
+	// Log the command (credentials are in separate auth file, not in command line)
 	if i.logger != nil {
-		logArgs := make([]string, len(args))
-		copy(logArgs, args)
-		// Mask password file path in log
-		for idx, arg := range logArgs {
-			if arg == "-ip" && idx+1 < len(logArgs) {
-				logArgs[idx+1] = "***"
-			}
-		}
 		i.logger.WithFields(logrus.Fields{
 			"command": "virt-v2v-inspector",
-			"args":    logArgs,
+			"args":    args,
+			"auth":    "via LIBVIRT_AUTH_FILE",
 		}).Info("Running virt-v2v-inspector command")
 	}
 
-	// Execute virt-v2v-inspector
+	// Execute virt-v2v-inspector with LIBVIRT_AUTH_FILE environment variable
 	cmd := exec.CommandContext(inspectCtx, i.virtV2vInspectorPath, args...)
+
+	// Set LIBVIRT_AUTH_FILE environment variable to point to our auth file
+	// This tells libvirt where to find authentication credentials
+	cmd.Env = append(os.Environ(), fmt.Sprintf("LIBVIRT_AUTH_FILE=%s", authFile))
 
 	// Filter out VDDK library paths from LD_LIBRARY_PATH to prevent supermin
 	// (called by libguestfs) from picking up VDDK's OpenSSL library
@@ -350,6 +341,53 @@ func findVDDKLibDir() string {
 
 // createPasswordFile creates a temporary file with the password
 // virt-v2v-inspector expects -ip to be a file path, not the password directly
+// createLibvirtAuthFile creates a libvirt auth.conf file with username and password
+// This allows us to avoid embedding credentials in the vpx:// URL
+// Format: https://libvirt.org/auth.html#client-configuration
+func (i *VirtV2vInspector) createLibvirtAuthFile(vcenterHost, username, password string) (string, error) {
+	tmpFile, err := os.CreateTemp("", "libvirt-auth-*.conf")
+	if err != nil {
+		return "", fmt.Errorf("failed to create temporary auth file: %w", err)
+	}
+
+	// Create libvirt auth.conf content
+	// Format:
+	// [credentials-vcenter]
+	// username=user
+	// password=pass
+	//
+	// [auth-esx-vcenterhost]
+	// credentials=vcenter
+	authContent := fmt.Sprintf(`[credentials-vcenter]
+username=%s
+password=%s
+
+[auth-esx-%s]
+credentials=vcenter
+`, username, password, vcenterHost)
+
+	// Write auth content to file
+	if _, err := tmpFile.WriteString(authContent); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpFile.Name())
+		return "", fmt.Errorf("failed to write auth file: %w", err)
+	}
+
+	// Close the file
+	if err := tmpFile.Close(); err != nil {
+		os.Remove(tmpFile.Name())
+		return "", fmt.Errorf("failed to close auth file: %w", err)
+	}
+
+	// Set restrictive permissions (read only by owner)
+	if err := os.Chmod(tmpFile.Name(), 0600); err != nil {
+		os.Remove(tmpFile.Name())
+		return "", fmt.Errorf("failed to set auth file permissions: %w", err)
+	}
+
+	return tmpFile.Name(), nil
+}
+
 func (i *VirtV2vInspector) createPasswordFile(password string) (string, error) {
 	tmpFile, err := os.CreateTemp("", "v2v-password-*")
 	if err != nil {
