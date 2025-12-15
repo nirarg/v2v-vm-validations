@@ -399,3 +399,8 @@ func (t *inflightTracker[T]) do(key CacheKey, fn func() (T, error)) (T, error, b
 
 	return call.val, call.err, false
 }
+
+// GetDB returns the database instance used by the inspector
+func (p *Inspector) GetDB() DB {
+	return p.db
+}
