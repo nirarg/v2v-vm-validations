@@ -48,7 +48,7 @@ func (i *VirtInspector) Inspect(
 	diskInfo *types.SnapshotDiskInfo, // Snapshot disk info from vm_service
 ) (*types.VirtInspectorXML, error) {
 
-	var nbdURL string
+	var nbdURLs []string
 	var sessionCloser func()
 
 	if UseVirtV2VOpen {
@@ -74,7 +74,7 @@ func (i *VirtInspector) Inspect(
 		if err != nil {
 			return nil, err
 		}
-		nbdURL = v2vSession.NBDURL
+		nbdURLs = []string{v2vSession.NBDURL}
 		sessionCloser = v2vSession.Close
 
 		// Give NBD time to initialize
@@ -91,34 +91,59 @@ func (i *VirtInspector) Inspect(
 		i.logger.WithFields(logrus.Fields{
 			"vm_moref":       diskInfo.VMMoref,
 			"snapshot_moref": diskInfo.SnapshotMoref,
-			"disk_path":      diskInfo.DiskPath,
-			"base_disk_path": diskInfo.BaseDiskPath,
+			"disk_count":     len(diskInfo.DiskPaths),
+			"disk_paths":     diskInfo.DiskPaths,
+			"base_disk_paths": diskInfo.BaseDiskPaths,
 		}).Debug("Using snapshot disk info from vm_service")
 
 		openCtx, cancel := context.WithTimeout(ctx, i.timeout)
 		defer cancel()
 
-		nbdkitSession, err := OpenWithNBDKitVDDK(
-			openCtx,
-			diskInfo.VMMoref,
-			diskInfo.SnapshotMoref,
-			diskInfo.BaseDiskPath,
-			vcenterURL,
-			username,
-			password,
-			i.logger,
-		)
-		if err != nil {
-			return nil, err
-		}
-		nbdURL = nbdkitSession.NBDURL
-		sessionCloser = nbdkitSession.Close
+		// Start one NBDkit session per disk
+		var nbdkitSessions []*NBDKitSession
 
-		// Wait for NBD server to be ready (more reliable than sleep)
-		if err := nbdkitSession.WaitForReady(30 * time.Second); err != nil {
-			i.logger.WithError(err).Error("NBD server not ready")
-			nbdkitSession.Close()
-			return nil, fmt.Errorf("NBD server not ready: %w", err)
+		for idx, baseDiskPath := range diskInfo.BaseDiskPaths {
+			i.logger.WithFields(logrus.Fields{
+				"disk_index":     idx,
+				"base_disk_path": baseDiskPath,
+			}).Debug("Starting NBDkit session for disk")
+
+			nbdkitSession, err := OpenWithNBDKitVDDK(
+				openCtx,
+				diskInfo.VMMoref,
+				diskInfo.SnapshotMoref,
+				baseDiskPath,
+				vcenterURL,
+				username,
+				password,
+				i.logger,
+			)
+			if err != nil {
+				// Close any sessions we've already created
+				for _, session := range nbdkitSessions {
+					session.Close()
+				}
+				return nil, fmt.Errorf("failed to start NBDkit session for disk %d: %w", idx, err)
+			}
+			nbdkitSessions = append(nbdkitSessions, nbdkitSession)
+			nbdURLs = append(nbdURLs, nbdkitSession.NBDURL)
+
+			// Wait for NBD server to be ready (more reliable than sleep)
+			if err := nbdkitSession.WaitForReady(30 * time.Second); err != nil {
+				i.logger.WithError(err).WithField("disk_index", idx).Error("NBD server not ready")
+				// Close all sessions
+				for _, session := range nbdkitSessions {
+					session.Close()
+				}
+				return nil, fmt.Errorf("NBD server not ready for disk %d: %w", idx, err)
+			}
+		}
+
+		// Create a cleanup function that closes all sessions
+		sessionCloser = func() {
+			for _, session := range nbdkitSessions {
+				session.Close()
+			}
 		}
 	}
 	defer sessionCloser()
@@ -126,10 +151,19 @@ func (i *VirtInspector) Inspect(
 	inspectCtx, cancel := context.WithTimeout(ctx, i.timeout)
 	defer cancel()
 
-	i.logger.WithField("nbd_url", nbdURL).Info("Running virt-inspector on NBD")
+	i.logger.WithFields(logrus.Fields{
+		"nbd_urls":   nbdURLs,
+		"disk_count": len(nbdURLs),
+	}).Info("Running virt-inspector on NBD")
 
-	cmdString := fmt.Sprintf("unset LD_LIBRARY_PATH && %s --format=raw -a '%s'",
-		i.virtInspectorPath, nbdURL)
+	// Build command with multiple -a options for all disks
+	// Format must be specified before each -a parameter
+	var aOptions string
+	for _, url := range nbdURLs {
+		aOptions += fmt.Sprintf(" --format=raw -a '%s'", url)
+	}
+	cmdString := fmt.Sprintf("unset LD_LIBRARY_PATH && %s%s",
+		i.virtInspectorPath, aOptions)
 
 	virtInspectorCmd := exec.CommandContext(inspectCtx, "sh", "-c", cmdString)
 
@@ -142,10 +176,11 @@ func (i *VirtInspector) Inspect(
 			exitCode = exitError.ExitCode()
 		}
 		i.logger.WithFields(logrus.Fields{
-			"output":    outputStr,
-			"exit_code": exitCode,
-			"nbd_url":   nbdURL,
-			"command":   cmdString,
+			"output":     outputStr,
+			"exit_code":  exitCode,
+			"nbd_urls":   nbdURLs,
+			"disk_count": len(nbdURLs),
+			"command":    cmdString,
 		}).Error("virt-inspector failed")
 
 		// Include output in error message for better debugging

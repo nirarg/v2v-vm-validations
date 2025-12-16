@@ -124,11 +124,14 @@ func (i *VirtV2vInspector) Inspect(
 		args = append(args, "-io", fmt.Sprintf("vddk-libdir=%s", vddkLibDir))
 	}
 
-	// Add disk file specification
-	// virt-v2v-inspector needs the disk file path in VDDK format
+	// Add disk file specifications for all disks
+	// virt-v2v-inspector needs the disk file paths in VDDK format
 	// Format: vddk-file=[datastore] path/to/disk.vmdk
-	if diskInfo.BaseDiskPath != "" {
-		args = append(args, "-io", fmt.Sprintf("vddk-file=%s", diskInfo.BaseDiskPath))
+	// Add one -io vddk-file= option for each disk
+	for _, baseDiskPath := range diskInfo.BaseDiskPaths {
+		if baseDiskPath != "" {
+			args = append(args, "-io", fmt.Sprintf("vddk-file=%s", baseDiskPath))
+		}
 	}
 
 	args = append(args, "--", vmName)
