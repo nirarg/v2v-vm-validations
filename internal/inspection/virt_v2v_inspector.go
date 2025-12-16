@@ -115,11 +115,20 @@ func (i *VirtV2vInspector) Inspect(
 		args = append(args, "-io", fmt.Sprintf("vddk-libdir=%s", vddkLibDir))
 	}
 
-	// Add disk file specification
+	// Add disk file specification for ALL disks
 	// virt-v2v-inspector needs the disk file path in VDDK format
 	// Format: vddk-file=[datastore] path/to/disk.vmdk
-	if diskInfo.BaseDiskPath != "" {
-		args = append(args, "-io", fmt.Sprintf("vddk-file=%s", diskInfo.BaseDiskPath))
+	// For VMs with multiple disks, add one -io vddk-file= option for each disk
+	if len(diskInfo.BaseDiskPaths) > 0 {
+		for idx, baseDiskPath := range diskInfo.BaseDiskPaths {
+			args = append(args, "-io", fmt.Sprintf("vddk-file=%s", baseDiskPath))
+			if i.logger != nil {
+				i.logger.WithFields(logrus.Fields{
+					"disk_index": idx,
+					"disk_path":  baseDiskPath,
+				}).Debug("Added vddk-file option for disk")
+			}
+		}
 	}
 
 	args = append(args, "--", vmName)
@@ -135,10 +144,6 @@ func (i *VirtV2vInspector) Inspect(
 
 	// Execute virt-v2v-inspector with LIBVIRT_AUTH_FILE environment variable
 	cmd := exec.CommandContext(inspectCtx, i.virtV2vInspectorPath, args...)
-
-	// Set LIBVIRT_AUTH_FILE environment variable to point to our auth file
-	// This tells libvirt where to find authentication credentials
-	cmd.Env = append(os.Environ(), fmt.Sprintf("LIBVIRT_AUTH_FILE=%s", authFile))
 
 	// Filter out VDDK library paths from LD_LIBRARY_PATH to prevent supermin
 	// (called by libguestfs) from picking up VDDK's OpenSSL library
@@ -167,6 +172,11 @@ func (i *VirtV2vInspector) Inspect(
 			filteredEnv = append(filteredEnv, e)
 		}
 	}
+
+	// Add LIBVIRT_AUTH_FILE to the filtered environment
+	// This tells libvirt where to find authentication credentials
+	filteredEnv = append(filteredEnv, fmt.Sprintf("LIBVIRT_AUTH_FILE=%s", authFile))
+
 	cmd.Env = filteredEnv
 
 	// Log environment filtering for debugging
