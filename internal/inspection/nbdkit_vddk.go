@@ -20,12 +20,13 @@ import (
 
 // NBDKitSession represents an NBD server session created by nbdkit with VDDK plugin
 type NBDKitSession struct {
-	NBDURL     string // Unix socket path or NBD URL
-	socketPath string // Unix socket path (if using Unix socket)
-	cmd        *exec.Cmd
-	logger     *logrus.Logger
-	stderrBuf  *bytes.Buffer
-	stdoutBuf  *bytes.Buffer
+	NBDURL       string // Unix socket path or NBD URL
+	socketPath   string // Unix socket path (if using Unix socket)
+	passwordFile string // Temporary password file path
+	cmd          *exec.Cmd
+	logger       *logrus.Logger
+	stderrBuf    *bytes.Buffer
+	stdoutBuf    *bytes.Buffer
 }
 
 // OpenWithNBDKitVDDK opens a VMware snapshot using nbdkit with VDDK plugin directly
@@ -72,6 +73,12 @@ func OpenWithNBDKitVDDK(
 	// Create temporary Unix socket for nbdkit (more reliable than TCP port)
 	socketPath := filepath.Join("/tmp", fmt.Sprintf("nbdkit-%s.sock", uuid.New().String()))
 
+	// Create temporary password file for secure password passing
+	passwordFile, err := createNBDKitPasswordFile(password)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create password file: %w", err)
+	}
+
 	// Determine VDDK library directory
 	vddkLibDir := "/opt/vmware-vix-disklib"
 	if _, err := os.Stat(vddkLibDir); err != nil {
@@ -88,6 +95,7 @@ func OpenWithNBDKitVDDK(
 	}
 
 	// Build nbdkit command with VDDK plugin
+	// Use password=+file to read password securely from file (not exposed in process list)
 	nbdkitArgs := []string{
 		"-U", socketPath, // Unix socket path
 		"--foreground",       // Run in foreground
@@ -96,7 +104,7 @@ func OpenWithNBDKitVDDK(
 		"vddk",               // VDDK plugin
 		fmt.Sprintf("server=%s", vcenterHost),
 		fmt.Sprintf("user=%s", username),
-		fmt.Sprintf("password=%s", password),
+		fmt.Sprintf("password=+%s", passwordFile), // Read password from file (secure)
 		fmt.Sprintf("vm=moref=%s", vmMoref),       // VM moref (required)
 		fmt.Sprintf("snapshot=%s", snapshotMoref), // Snapshot moref to read from
 		fmt.Sprintf("file=%s", baseDiskPath),      // Base VMDK file path
@@ -111,14 +119,14 @@ func OpenWithNBDKitVDDK(
 	// Add verbose for debugging
 	// nbdkitArgs = append(nbdkitArgs, "--verbose")
 
-	// Log the command (without password)
+	// Log the command (mask password file path)
 	if logger != nil {
 		logArgs := make([]string, len(nbdkitArgs))
 		copy(logArgs, nbdkitArgs)
-		// Mask password in log
+		// Mask password file path in log
 		for i, arg := range logArgs {
-			if len(arg) > 8 && arg[:8] == "password=" {
-				logArgs[i] = "password=***"
+			if len(arg) > 10 && arg[:10] == "password=+" {
+				logArgs[i] = "password=+***"
 			}
 		}
 		logger.WithFields(logrus.Fields{
@@ -192,12 +200,13 @@ func OpenWithNBDKitVDDK(
 	nbdURL := fmt.Sprintf("nbd+unix:///?socket=%s", socketPath)
 
 	return &NBDKitSession{
-		NBDURL:     nbdURL,
-		socketPath: socketPath,
-		cmd:        cmd,
-		logger:     logger,
-		stderrBuf:  stderrBuf,
-		stdoutBuf:  stdoutBuf,
+		NBDURL:       nbdURL,
+		socketPath:   socketPath,
+		passwordFile: passwordFile,
+		cmd:          cmd,
+		logger:       logger,
+		stderrBuf:    stderrBuf,
+		stdoutBuf:    stdoutBuf,
 	}, nil
 }
 
@@ -230,6 +239,11 @@ func (s *NBDKitSession) Close() {
 	// Clean up Unix socket file
 	if s.socketPath != "" {
 		_ = os.Remove(s.socketPath)
+	}
+
+	// Clean up password file
+	if s.passwordFile != "" {
+		_ = os.Remove(s.passwordFile)
 	}
 }
 
@@ -379,4 +393,34 @@ func getVCenterThumbprint(vcenterHost string) (string, error) {
 	}
 
 	return formatted, nil
+}
+
+// createNBDKitPasswordFile creates a temporary file with the password for nbdkit
+// nbdkit-vddk-plugin supports password=+file to read password securely from file
+func createNBDKitPasswordFile(password string) (string, error) {
+	tmpFile, err := os.CreateTemp("", "nbdkit-password-*")
+	if err != nil {
+		return "", fmt.Errorf("failed to create temporary password file: %w", err)
+	}
+
+	// Write password to file
+	if _, err := tmpFile.WriteString(password); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpFile.Name())
+		return "", fmt.Errorf("failed to write password to file: %w", err)
+	}
+
+	// Close the file
+	if err := tmpFile.Close(); err != nil {
+		os.Remove(tmpFile.Name())
+		return "", fmt.Errorf("failed to close password file: %w", err)
+	}
+
+	// Set restrictive permissions (read-only for owner)
+	if err := os.Chmod(tmpFile.Name(), 0600); err != nil {
+		os.Remove(tmpFile.Name())
+		return "", fmt.Errorf("failed to set password file permissions: %w", err)
+	}
+
+	return tmpFile.Name(), nil
 }
