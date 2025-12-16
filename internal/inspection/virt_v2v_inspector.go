@@ -59,13 +59,14 @@ func (i *VirtV2vInspector) Inspect(
 	// Format: vpx://username@vcenter/compute-resource-path?ssl-verify
 	// The path must point to a compute resource (host/cluster), not the datacenter or VM
 	// The VM name is specified as a positional argument after "--"
+	// Username is in URL (needed by virt-v2v-inspector to pass to VDDK)
+	// Password is provided via -ip file (secure)
 	// Extract hostname from vCenter URL
 	vcenterHost := extractHostname(vcenterURL)
 
 	// URL-encode username to handle special characters like @
 	// The @ symbol in the username needs to be percent-encoded as %40
 	// because @ is used as a delimiter between username and hostname in URLs
-	// We use url.QueryEscape which encodes @ as %40
 	encodedUsername := url.QueryEscape(username)
 
 	// Use the compute resource path from diskInfo (e.g., "/Datacenter/Cluster/host.example.com")
@@ -75,9 +76,9 @@ func (i *VirtV2vInspector) Inspect(
 		return nil, fmt.Errorf("compute resource path is required for vpx:// URL")
 	}
 
-	// Build vpx:// URL (without snapshot parameter)
-	// Inspect the base/parent disk file directly
-	// The snapshot parameter is not needed when using the parent file
+	// Build vpx:// URL with username
+	// virt-v2v-inspector extracts the username from this URL to pass to VDDK internally
+	// Password is kept secure in separate file via -ip parameter
 	// Add SSL verification parameter (provided by caller)
 	libvirtURL := fmt.Sprintf("vpx://%s@%s%s?%s",
 		encodedUsername, vcenterHost, computeResourcePath, sslVerify)
@@ -86,8 +87,8 @@ func (i *VirtV2vInspector) Inspect(
 	inspectCtx, cancel := context.WithTimeout(ctx, i.timeout)
 	defer cancel()
 
-	// virt-v2v-inspector expects -ip to be a file path, not the password directly
-	// Create a temporary file with the password
+	// Create a password file for VDDK authentication
+	// VDDK uses -io vddk-password=+file to read password securely
 	passwordFile, err := i.createPasswordFile(password)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create password file: %w", err)
@@ -97,12 +98,14 @@ func (i *VirtV2vInspector) Inspect(
 	var output []byte
 
 	// Build virt-v2v-inspector command
+	// Libvirt authentication is handled via LIBVIRT_AUTH_FILE environment variable
+	// The -ip password file provides credentials for both libvirt and VDDK (used internally)
 	args := []string{
 		"-v",            // Verbose
 		"-x",            // Debug
 		"-i", "libvirt", // Input type: libvirt
-		"-ic", libvirtURL, // libvirt connection URI (vpx://...)
-		"-ip", passwordFile, // libvirt password file path (not password directly)
+		"-ic", libvirtURL, // libvirt connection URI (vpx://... without credentials)
+		"-ip", passwordFile, // Password file (used by virt-v2v-inspector for VDDK authentication)
 		"-it", "vddk", // Input transport: VDDK
 	}
 
@@ -130,11 +133,11 @@ func (i *VirtV2vInspector) Inspect(
 
 	args = append(args, "--", vmName)
 
-	// Log the command (without password file path)
+	// Log the command (mask password file path for security)
 	if i.logger != nil {
 		logArgs := make([]string, len(args))
 		copy(logArgs, args)
-		// Mask password file path in log
+		// Mask password file path in -ip option
 		for idx, arg := range logArgs {
 			if arg == "-ip" && idx+1 < len(logArgs) {
 				logArgs[idx+1] = "***"
